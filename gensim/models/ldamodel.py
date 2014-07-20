@@ -47,9 +47,10 @@ try:
     from scipy.maxentropy import logsumexp # log(sum(exp(x))) that tries to avoid overflow
 except ImportError: # maxentropy has been removed for next release
     from scipy.misc import logsumexp
+
+
 from gensim import interfaces, utils
-
-
+from six.moves import xrange
 
 
 def dirichlet_expectation(alpha):
@@ -181,7 +182,7 @@ class LdaModel(interfaces.TransformationABC):
     """
     def __init__(self, corpus=None, num_topics=100, id2word=None, distributed=False,
                  chunksize=2000, passes=1, update_every=1, alpha='symmetric', eta=None, decay=0.5,
-                 eval_every=10):
+                 eval_every=10, iterations=50, gamma_threshold=0.001):
         """
         If given, start training from the iterable `corpus` straight away. If not given,
         the model is left untrained (presumably because you want to call `update()` manually).
@@ -202,7 +203,7 @@ class LdaModel(interfaces.TransformationABC):
         normalized asymmetric 1.0/topicno prior, the latter learns an asymmetric
         prior directly from your data.
 
-        Turn on `distributed` to force distributed computing (see the web tutorial
+        Turn on `distributed` to force distributed computing (see the `web tutorial <http://radimrehurek.com/gensim/distributed.html>`_
         on how to set up a cluster of machines for gensim).
 
         Calculate and log perplexity estimate from the latest mini-batch every
@@ -212,9 +213,9 @@ class LdaModel(interfaces.TransformationABC):
         Example:
 
         >>> lda = LdaModel(corpus, num_topics=100)  # train model
-        >>> print lda[doc_bow] # get topic probability distribution for a document
+        >>> print(lda[doc_bow]) # get topic probability distribution for a document
         >>> lda.update(corpus2) # update the LDA model with additional documents
-        >>> print lda[doc_bow]
+        >>> print(lda[doc_bow])
 
         >>> lda = LdaModel(corpus, num_topics=50, alpha='auto', eval_every=5)  # train asymmetric alpha from data
 
@@ -228,8 +229,10 @@ class LdaModel(interfaces.TransformationABC):
             logger.warning("no word id mapping provided; initializing from corpus, assuming identity")
             self.id2word = utils.dict_from_corpus(corpus)
             self.num_terms = len(self.id2word)
+        elif len(self.id2word) > 0:
+            self.num_terms = 1 + max(self.id2word.keys())
         else:
-            self.num_terms = 1 + max([-1] + self.id2word.keys())
+            self.num_terms = 0
 
         if self.num_terms == 0:
             raise ValueError("cannot compute LDA over an empty collection (no terms)")
@@ -267,8 +270,8 @@ class LdaModel(interfaces.TransformationABC):
             self.eta = eta
 
         # VB constants
-        self.VAR_MAXITER = 50
-        self.VAR_THRESH = 0.001
+        self.iterations = iterations
+        self.gamma_threshold = gamma_threshold
 
         # set up distributed environment if necessary
         if not distributed:
@@ -289,7 +292,7 @@ class LdaModel(interfaces.TransformationABC):
                 self.dispatcher = dispatcher
                 self.numworkers = len(dispatcher.getworkers())
                 logger.info("using distributed version with %i workers" % self.numworkers)
-            except Exception, err:
+            except Exception as err:
                 logger.error("failed to initialize distributed LDA (%s)" % err)
                 raise RuntimeError("failed to initialize distributed LDA (%s)" % err)
 
@@ -367,7 +370,7 @@ class LdaModel(interfaces.TransformationABC):
             phinorm = numpy.dot(expElogthetad, expElogbetad) + 1e-100 # TODO treat zeros explicitly, instead of adding eps?
 
             # Iterate between gamma and phi until convergence
-            for _ in xrange(self.VAR_MAXITER):
+            for _ in xrange(self.iterations):
                 lastgamma = gammad
                 # We represent phi implicitly to save memory and time.
                 # Substituting the value of the optimal phi back into
@@ -378,7 +381,7 @@ class LdaModel(interfaces.TransformationABC):
                 phinorm = numpy.dot(expElogthetad, expElogbetad) + 1e-100
                 # If gamma hasn't changed much, we're done.
                 meanchange = numpy.mean(abs(gammad - lastgamma))
-                if (meanchange < self.VAR_THRESH):
+                if (meanchange < self.gamma_threshold):
                     converged += 1
                     break
             gamma[d, :] = gammad
@@ -388,8 +391,8 @@ class LdaModel(interfaces.TransformationABC):
                 sstats[:, ids] += numpy.outer(expElogthetad.T, cts / phinorm)
 
         if len(chunk) > 1:
-            logger.info("%i/%i documents converged within %i iterations" %
-                         (converged, len(chunk), self.VAR_MAXITER))
+            logger.debug("%i/%i documents converged within %i iterations" %
+                (converged, len(chunk), self.iterations))
 
         if collect_sstats:
             # This step finishes computing the sufficient statistics for the
@@ -454,7 +457,8 @@ class LdaModel(interfaces.TransformationABC):
         return perwordbound
 
 
-    def update(self, corpus, chunksize=None, decay=None, passes=None, update_every=None, eval_every=None):
+    def update(self, corpus, chunksize=None, decay=None, passes=None, update_every=None, eval_every=None,
+            iterations=None, gamma_threshold=None):
         """
         Train the model with new documents, by EM-iterating over `corpus` until
         the topics converge (or until the maximum number of allowed iterations
@@ -483,6 +487,10 @@ class LdaModel(interfaces.TransformationABC):
             update_every = self.update_every
         if eval_every is None:
             eval_every = self.eval_every
+        if iterations is None:
+            iterations = self.iterations
+        if gamma_threshold is None:
+            gamma_threshold = self.gamma_threshold
 
         # rho is the "speed" of updating; TODO try other fncs
         rho = lambda: pow(1.0 + self.num_updates, -decay)
@@ -498,25 +506,28 @@ class LdaModel(interfaces.TransformationABC):
 
         self.state.numdocs += lencorpus
 
-        if update_every > 0:
+        if update_every:
             updatetype = "online"
             updateafter = min(lencorpus, update_every * self.numworkers * chunksize)
-            evalafter = min(lencorpus, eval_every * self.numworkers * chunksize)
         else:
             updatetype = "batch"
             updateafter = lencorpus
-            evalafter = lencorpus
+        evalafter = min(lencorpus, (eval_every or 0) * self.numworkers * chunksize)
 
         updates_per_pass = max(1, lencorpus / updateafter)
         logger.info("running %s LDA training, %s topics, %i passes over "
                     "the supplied corpus of %i documents, updating model once "
-                    "every %i documents, evaluating every %i documents" %
-                    (updatetype, self.num_topics, passes, lencorpus, updateafter, evalafter))
+                    "every %i documents, evaluating perplexity every %i documents, "
+                    "iterating %ix with a convergence threshold of %f" %
+                    (updatetype, self.num_topics, passes, lencorpus,
+                        updateafter, evalafter, iterations,
+                        gamma_threshold))
+
         if updates_per_pass * passes < 10:
             logger.warning("too few updates, training might not converge; consider "
-                           "increasing the number of passes to improve accuracy")
+                           "increasing the number of passes or iterations to improve accuracy")
 
-        for iteration in xrange(passes):
+        for pass_ in xrange(passes):
             if self.dispatcher:
                 logger.info('initializing %s workers' % self.numworkers)
                 self.dispatcher.reset(self.state)
@@ -533,13 +544,13 @@ class LdaModel(interfaces.TransformationABC):
 
                 if self.dispatcher:
                     # add the chunk to dispatcher's job queue, so workers can munch on it
-                    logger.info('PROGRESS: iteration %i, dispatching documents up to #%i/%i' %
-                                (iteration, chunk_no * chunksize + len(chunk), lencorpus))
+                    logger.info('PROGRESS: pass %i, dispatching documents up to #%i/%i' %
+                                (pass_, chunk_no * chunksize + len(chunk), lencorpus))
                     # this will eventually block until some jobs finish, because the queue has a small finite length
                     self.dispatcher.putjob(chunk)
                 else:
-                    logger.info('PROGRESS: iteration %i, at document #%i/%i' %
-                                (iteration, chunk_no * chunksize + len(chunk), lencorpus))
+                    logger.info('PROGRESS: pass %i, at document #%i/%i' %
+                                (pass_, chunk_no * chunksize + len(chunk), lencorpus))
                     gammat = self.do_estep(chunk, other)
 
                     if self.optimize_alpha:
@@ -644,14 +655,17 @@ class LdaModel(interfaces.TransformationABC):
 
     def show_topics(self, topics=10, topn=10, log=False, formatted=True):
         """
-        Print the `topN` most probable words for `topics` number of topics.
-        Set `topics=-1` to print all topics.
+        For `topics` number of topics, return `topn` most significant words
+        (10 words per topic, by default).
 
-        Unlike LSA, there is no ordering between the topics in LDA.
-        The printed `topics <= self.num_topics` subset of all topics is therefore
-        arbitrary and may change between two runs.
+        The topics are returned as a list -- a list of strings if `formatted` is
+        True, or a list of (probability, word) 2-tuples if False.
 
-        Set `formatted=True` to return the topics as a list of strings, or `False` as lists of (weight, word) pairs.
+        If `log` is True, also output this result to log.
+
+        Unlike LSA, there is no natural ordering between the topics in LDA.
+        The returned `topics <= self.num_topics` subset of all topics is therefore
+        arbitrary and may change between two LDA training runs.
 
         """
         if topics < 0 or topics >= self.num_topics:
@@ -663,7 +677,7 @@ class LdaModel(interfaces.TransformationABC):
             sorted_topics = list(numpy.argsort(sort_alpha))
             chosen_topics = sorted_topics[ : topics/2] + sorted_topics[-topics/2 : ]
         shown = []
-        for i in chosen_topics[::-1]:
+        for i in chosen_topics:
             if formatted:
                 topic = self.print_topic(i, topn=topn)
             else:
@@ -703,10 +717,31 @@ class LdaModel(interfaces.TransformationABC):
                 if topicvalue >= eps] # ignore document's topics that have prob < eps
 
 
-    def save(self, fname):
-        dispatcher, self.dispatcher = self.dispatcher, None
+    def save(self, fname, *args, **kwargs):
+        """
+        Save the model to file.
+
+        Large internal arrays may be stored into separate files, with `fname` as prefix.
+
+        """
+        if self.state is not None:
+            self.state.save(fname + '.state', *args, **kwargs)
+        super(LdaModel, self).save(fname, *args, ignore=['state', 'dispatcher'], **kwargs)
+
+
+    @classmethod
+    def load(cls, fname, *args, **kwargs):
+        """
+        Load a previously saved object from file (also see `save`).
+
+        Large arrays are mmap'ed back as read-only (shared memory).
+
+        """
+        kwargs['mmap'] = kwargs.get('mmap', 'r')
+        result = super(LdaModel, cls).load(fname, *args, **kwargs)
         try:
-            super(LdaModel, self).save(fname)
-        finally:
-            self.dispatcher = dispatcher
+            result.state = super(LdaModel, cls).load(fname + '.state', *args, **kwargs)
+        except Exception as e:
+            logging.warning("failed to load state from %s: %s" % (fname + '.state', e))
+        return result
 #endclass LdaModel
